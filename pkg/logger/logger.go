@@ -21,6 +21,10 @@ func (l Logger) Error(ctx context.Context, msg string, fields ...zap.Field) {
 	l.l.Error(msg, fields...)
 }
 
+func (l Logger) Fatal(ctx context.Context, msg string, fields ...zap.Field) {
+	l.l.Fatal(msg, fields...)
+}
+
 func New(ctx context.Context) (context.Context, error) {
 	logger, err := zap.NewProduction()
 	if err != nil {
