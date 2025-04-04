@@ -5,8 +5,9 @@ import (
 	"CBA-Backproxy/internal/server"
 	"CBA-Backproxy/pkg/logger"
 	"context"
-	"fmt"
 	"go.uber.org/zap"
+	"log"
+	"os"
 	"time"
 )
 
@@ -15,13 +16,15 @@ const (
 )
 
 func main() {
+	if _, err := os.Stat("./config/config.yaml"); os.IsNotExist(err) {
+		log.Fatal("Конфиг не найден. Создайте config.yaml на основе config.example.yaml")
+	}
 	ctx := context.Background()
 	ctx, err := logger.New(ctx)
 	if err != nil {
 		logger.GetLoggerFromCtx(ctx).Error(ctx, "Failed to create logger", zap.Error(err))
 	}
 	cfg, err := config.NewConfig()
-	fmt.Println(cfg)
 	if err != nil {
 		logger.GetLoggerFromCtx(ctx).Error(ctx, "Failed to create config", zap.Error(err))
 	}
@@ -30,7 +33,7 @@ func main() {
 		srv.Run(cfg.Host, cfg.Port)
 	}()
 	for {
-		if len(srv.Clients) != 0 {
+		if len(srv.FreeClients) != 0 {
 			go func() {
 				srv.RunSocks5()
 			}()

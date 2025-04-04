@@ -4,38 +4,77 @@ import (
 	"CBA-Backproxy/internal/client"
 	"CBA-Backproxy/pkg/logger"
 	"context"
-	"fmt"
 	"github.com/google/uuid"
-
-	//"github.com/google/uuid"
 	"github.com/things-go/go-socks5"
 	"go.uber.org/zap"
 	"log"
 	"math/rand"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
 
 const (
 	defaultTimeout = time.Second
+	clientTTL      = 30 * time.Second
 )
 
 type Server struct {
-	listener   net.Listener
-	socks5port string
-	ctx        context.Context
-	clientConn net.Conn
-	Clients    map[string]client.Client
-	mu         sync.Mutex
+	listener         net.Listener
+	socks5port       string
+	ctx              context.Context
+	clientConn       net.Conn
+	FreeClients      map[string]*client.Client
+	BusyClients      map[string]*client.Client
+	FreeClientsCount int
+	mu               sync.Mutex
+	remoteAddr       string
 }
 
 func NewServer(ctx context.Context, socks5port string) *Server {
-	return &Server{
-		ctx:        ctx,
-		socks5port: socks5port,
-		Clients:    make(map[string]client.Client),
+	s := &Server{
+		ctx:         ctx,
+		socks5port:  socks5port,
+		FreeClients: make(map[string]*client.Client),
+		BusyClients: make(map[string]*client.Client),
+	}
+	go s.startClientTTLChecker()
+	return s
+}
+
+func (s *Server) startClientTTLChecker() {
+	ticker := time.NewTicker(time.Second * 5)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.checkClientTTL()
+		case <-s.ctx.Done():
+			return
+		}
+	}
+}
+
+func (s *Server) checkClientTTL() {
+	now := time.Now()
+	for id, cl := range s.BusyClients {
+		activePrograms := make([]client.Program, 0, len(cl.Cp))
+		for _, p := range cl.Cp {
+			if now.Sub(p.LastActivity) <= clientTTL {
+				activePrograms = append(activePrograms, p)
+			}
+		}
+		if len(activePrograms) == 0 {
+			s.FreeClients[id] = cl
+			s.FreeClientsCount++
+			delete(s.BusyClients, id)
+			logger.GetLoggerFromCtx(s.ctx).Info(s.ctx, "Client moved back to free pool due to TTL", zap.String("id", id))
+		} else if len(activePrograms) != len(cl.Cp) {
+			cl.Cp = activePrograms
+		}
 	}
 }
 
@@ -72,7 +111,13 @@ func (s *Server) handleConnection(conn net.Conn) {
 	id := uuid.New().String()
 	logger.GetLoggerFromCtx(s.ctx).Info(s.ctx, "Accepted connection from client", zap.String("id", id))
 	s.mu.Lock()
-	s.Clients[id] = client.Client{Ip: conn.RemoteAddr().String(), Ctx: s.ctx, Conn: conn}
+
+	s.FreeClients[id] = &client.Client{
+		Ctx:  s.ctx,
+		Conn: conn,
+		Cp:   []client.Program{},
+	}
+	s.FreeClientsCount++
 	s.mu.Unlock()
 	buffer = make([]byte, 1024)
 	for {
@@ -89,34 +134,101 @@ func (s *Server) handleConnection(conn net.Conn) {
 }
 
 func (s *Server) CloseAllConnections() {
-	for _, client := range s.Clients {
-		client.Conn.Close()
+	for _, cl := range s.FreeClients {
+		err := cl.Conn.Close()
+		if err != nil {
+			logger.GetLoggerFromCtx(s.ctx).Error(s.ctx, "Failed to close connection", zap.Error(err))
+		}
 	}
 }
 
-func (s *Server) SendReqToClient(addr string) {
-	keys := make([]string, 0, len(s.Clients))
-	for k := range s.Clients {
-		keys = append(keys, k)
+func (s *Server) SendReqToClient(addr string, remoteAddr string) {
+	for _, cl := range s.BusyClients {
+		for i := range cl.Cp {
+			if cl.Cp[i].AddrClientProgram == remoteAddr {
+				s.mu.Lock()
+				cl.Cp[i].LastActivity = time.Now()
+				s.mu.Unlock()
+				s.clientConn = cl.Conn
+				_, err := s.clientConn.Write([]byte(addr))
+				if err != nil {
+					logger.GetLoggerFromCtx(s.ctx).Error(s.ctx, "Failed to send request to c", zap.Error(err))
+				}
+				return
+			}
+		}
 	}
-	randomKey := keys[rand.Intn(len(keys))]
-	s.clientConn = s.Clients[randomKey].Conn
-	_, err := s.clientConn.Write([]byte(addr))
-	if err != nil {
-		logger.GetLoggerFromCtx(s.ctx).Error(s.ctx, "Failed to send request to client", zap.Error(err))
+	if len(s.FreeClients) == 0 {
+		c := 10000
+		for _, cl := range s.BusyClients {
+			for _, a := range cl.Cp {
+				if len(a.AddrClientProgram) < c {
+					c = len(a.AddrClientProgram)
+				}
+			}
+		}
+		for _, cl := range s.BusyClients {
+			for _, a := range cl.Cp {
+				if len(a.AddrClientProgram) == c {
+					s.mu.Lock()
+					a.LastActivity = time.Now()
+					s.mu.Unlock()
+					s.clientConn = cl.Conn
+					cl.Cp = append(cl.Cp, a)
+					_, err := s.clientConn.Write([]byte(addr))
+					if err != nil {
+						logger.GetLoggerFromCtx(s.ctx).Error(s.ctx, "Failed to send request to c", zap.Error(err))
+					}
+					return
+				}
+			}
+		}
+	}
+	put := false
+	if s.FreeClientsCount > 0 {
+		var c *client.Client
+		keys := make([]string, 0, len(s.FreeClients))
+		for k := range s.FreeClients {
+			keys = append(keys, k)
+		}
+		randomKey := keys[rand.Intn(len(keys))]
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for _, a := range s.FreeClients[randomKey].Cp {
+			if a.AddrClientProgram == "" {
+				put = true
+				a.AddrClientProgram = remoteAddr
+				a.LastActivity = time.Now()
+			}
+		}
+		if !put {
+			s.FreeClients[randomKey].Cp = append(s.FreeClients[randomKey].Cp, client.Program{
+				AddrClientProgram: remoteAddr,
+				LastActivity:      time.Now(),
+			})
+		}
+		c = s.FreeClients[randomKey]
+		s.BusyClients[randomKey] = c
+		delete(s.FreeClients, randomKey)
+		s.FreeClientsCount--
+		s.clientConn = s.BusyClients[randomKey].Conn
+		_, err := s.clientConn.Write([]byte(addr))
+		if err != nil {
+			logger.GetLoggerFromCtx(s.ctx).Error(s.ctx, "Failed to send request to c", zap.Error(err))
+		}
 	}
 }
 
 func (s *Server) RunSocks5() {
+	logger.GetLoggerFromCtx(s.ctx).Info(s.ctx, "Starting socks5 server")
 	customDialer := &CustomDialer{
 		s: s,
 	}
 	server := socks5.NewServer(
+		socks5.WithDialAndRequest(customDialer.Dial),
 		socks5.WithLogger(socks5.NewLogger(log.New(os.Stdout, "socks5: ", log.LstdFlags))),
-		socks5.WithDial(customDialer.Dial),
 	)
-	logger.GetLoggerFromCtx(s.ctx).Info(s.ctx, "Socks5 Server started on port"+s.socks5port)
-	if err := server.ListenAndServe("tcp", ":"+s.socks5port); err != nil {
+	if err := server.ListenAndServe("tcp", ":10800"); err != nil {
 		logger.GetLoggerFromCtx(s.ctx).Fatal(s.ctx, "Failed to start socks5 server", zap.Error(err))
 	}
 }
@@ -125,9 +237,10 @@ type CustomDialer struct {
 	s *Server
 }
 
-func (d *CustomDialer) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
-	d.s.SendReqToClient(addr)
-	fmt.Println(addr)
-	fmt.Println(network)
+func (d *CustomDialer) Dial(ctx context.Context, network, addr string, request *socks5.Request) (net.Conn, error) {
+	ra := strings.Split(request.RemoteAddr.String(), ":")
+	d.s.remoteAddr = ra[0]
+	logger.GetLoggerFromCtx(d.s.ctx).Info(d.s.ctx, "Received request from client", zap.String("address", d.s.remoteAddr))
+	d.s.SendReqToClient(addr, d.s.remoteAddr)
 	return net.Dial(network, addr)
 }

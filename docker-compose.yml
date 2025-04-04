@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  server:
+    build:
+      dockerfile: server.Dockerfile
+    networks:
+      - back-proxy-net
+    ports:
+      - "18000:18000"
+      - "10800:10800"
+    environment:
+      - SOCKS5_PORT=10800
+      - SERVER_PORT=18000
+      - SERVER_HOST=0.0.0.0
+
+  client:
+    build:
+      dockerfile: client.Dockerfile
+    depends_on:
+      - server
+    networks:
+      - back-proxy-net
+    dns: 8.8.8.8
+
+networks:
+  back-proxy-net:
+    driver: bridge

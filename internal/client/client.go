@@ -8,12 +8,18 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 )
+
+type Program struct {
+	LastActivity      time.Time
+	AddrClientProgram string
+}
 
 type Client struct {
 	Ctx  context.Context
-	Ip   string
 	Conn net.Conn
+	Cp   []Program
 }
 
 func NewClient(ctx context.Context) *Client {
@@ -23,18 +29,25 @@ func NewClient(ctx context.Context) *Client {
 }
 
 func reverseDNSLookup(ip string) (string, error) {
-	names, err := net.LookupAddr(ip)
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{}
+			return d.DialContext(ctx, "udp", "8.8.8.8:53")
+		},
+	}
+	names, err := resolver.LookupAddr(context.Background(), ip)
 	if err != nil {
-		return "", err
+		return ip, nil
 	}
 	if len(names) > 0 {
 		return strings.TrimSuffix(names[0], "."), nil
 	}
-	return "", fmt.Errorf("no domain found for IP: %s", ip)
+	return ip, nil
 }
 
-func (c *Client) Connect() {
-	serverConn, err := net.Dial("tcp", "localhost:18000")
+func (c *Client) Connect(host, port string) {
+	serverConn, err := net.Dial("tcp", host+":"+port)
 	if err != nil {
 		logger.GetLoggerFromCtx(c.Ctx).Error(c.Ctx, "Failed to connect to server", zap.Error(err))
 		return
@@ -65,6 +78,7 @@ func (c *Client) Connect() {
 		ip, port := parts[0], parts[1]
 
 		domain, err := reverseDNSLookup(ip)
+		fmt.Println(domain)
 		if err != nil {
 			logger.GetLoggerFromCtx(c.Ctx).Error(c.Ctx, "Failed to resolve IP to domain", zap.Error(err))
 			return
